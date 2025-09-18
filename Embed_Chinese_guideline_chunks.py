@@ -61,7 +61,7 @@ $ python embed_to_chroma.py
 (or set envs first, e.g., EMBED_MAX_LEN=256 EMBED_BATCH_SIZE=8 for tighter VRAM)
 """
 
-import os
+import os, re
 import json
 import hashlib
 from pathlib import Path
@@ -155,9 +155,53 @@ def jsonl_iter(path: Path) -> Iterable[Dict[str, Any]]:
                 continue
 
 # ---------------------------
+# 入库前统一 meta 字段. 重嵌后，“未知来源/年份”会自然消失.
+# ---------------------------
+
+def _stem(path: str | None) -> str | None:
+    if not path:
+        return None
+    base = os.path.basename(str(path))
+    return re.sub(r'\.[^.]+$', '', base)
+
+def _infer_year(meta: dict) -> str | None:
+    for cand in (meta.get("year"), meta.get("publish_date"), meta.get("date"),
+                 meta.get("title"), meta.get("source_filename")):
+        if not cand:
+            continue
+        m = re.search(r'(19|20)\d{2}', str(cand))
+        if m:
+            return m.group(0)
+    return None
+
+def normalize_meta(meta: dict) -> dict:
+    """
+    Standardize keys so downstream code always sees title/source/year.
+    """
+    m = dict(meta or {})
+    # Title
+    m["title"] = (m.get("title")
+                  or m.get("doc_title")
+                  or m.get("original_guideline_title")
+                  or _stem(m.get("source_filename"))
+                  or "")
+    # Source (机构/期刊/发布方). Fallback to filename stem or title if journal absent.
+    m["source"] = (m.get("source")
+                   or m.get("journal_name")
+                   or _stem(m.get("source_filename"))
+                   or m.get("title")
+                   or "未知来源")
+    # Year → 4-digit
+    y = _infer_year(m)
+    if y:
+        m["year"] = y
+    return m
+
+# ---------------------------
 # Metadata sanitizer (prevents list/dict errors in Chroma)
 # ---------------------------
-def sanitize_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
+def sanitize_meta(meta: dict, max_len: int = 2000) -> dict:
+    """Lenient sanitizer: keep keys (incl. title/source/year), coerce values to short strings."""
     """
     Chroma requires scalar metadata values: str, int, float, bool, or None.
     This function converts:
@@ -168,21 +212,16 @@ def sanitize_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
     Example fix:
         ["秦煜"]  → "秦煜"
     """
-    clean: Dict[str, Any] = {}
-    for k, v in meta.items():
-        if isinstance(v, (str, int, float, bool)) or v is None:
-            clean[k] = v
-        elif isinstance(v, (list, tuple, set)):
-            seq = list(v)
-            if all(isinstance(x, (str, int, float, bool)) or x is None for x in seq):
-                clean[k] = ", ".join("" if x is None else str(x) for x in seq)
-            else:
-                clean[k] = json.dumps(seq, ensure_ascii=False)
-        elif isinstance(v, dict):
-            clean[k] = json.dumps(v, ensure_ascii=False, sort_keys=True)
-        else:
-            clean[k] = str(v)
-    return clean
+    out = {}
+    for k, v in (meta or {}).items():
+        if v is None:
+            continue
+        s = v if isinstance(v, str) else str(v)
+        s = s.strip()
+        if not s:
+            continue
+        out[k] = s[:max_len]
+    return out
 
 # ---------------------------
 # Optional VRAM stats (debug)
@@ -312,8 +351,15 @@ def main():
 
         # Extract and sanitize
         docs  = [b["content"] for b in batch]
-        metas = [sanitize_meta(b["meta"]) for b in batch]
-        ids   = [stable_id(b["meta"], b["content"]) for b in batch]
+
+        # BEFORE:
+        # metas = [sanitize_meta(b["meta"]) for b in batch]
+        # ids   = [stable_id(b["meta"], b["content"]) for b in batch]
+
+        # AFTER: normalize → sanitize, and compute IDs from normalized meta
+        normed = [normalize_meta(b["meta"]) for b in batch]
+        metas  = [sanitize_meta(m) for m in normed]
+        ids    = [stable_id(m, b["content"]) for m, b in zip(normed, batch)]
 
         # Embed with OOM backoff
         try:

@@ -30,20 +30,39 @@ import sqlite3
 from typing import Any, Dict, List, Optional
 
 from chromadb import PersistentClient
+from chromadb.utils import embedding_functions
 from sentence_transformers import SentenceTransformer
 
 # ---- Env / Defaults (match your screenshots)
 CHROMA_DIR: str = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
-COLLECTION_NAME: str = os.getenv("CHROMA_COLLECTION", "guideline_chunks")  # preferred name
+# COLLECTION_NAME: str = os.getenv("CHROMA_COLLECTION", "guideline_chunks") 
+COLLECTION    = os.getenv("CHROMA_COLLECTION", "guideline_chunks_1024_v2") # preferred name
 SQLITE_PATH: str = os.getenv("SQLITE_PATH", "./db/drugs.sqlite")
-EMBED_MODEL: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-zh-v1.5")
+PERSIST_DIR: str = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
 # EMBED_MODEL: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh")
+EMBED_MODEL: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-zh-v1.5")
+
+
+try:
+    import torch
+    _dev = "cuda" if torch.cuda.is_available() else "cpu"
+except Exception:
+    _dev = "cpu"
+embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+    model_name=EMBED_MODEL,
+    # device="cuda"  # or "cpu" if no GPU
+    device=_dev
+    # normalize=True  # if your version supports; otherwise leave off
+)
 
 # ---- Lazy singletons
 _embedder: Optional[SentenceTransformer] = None
-_chroma_client: Optional[PersistentClient] = None
+# _chroma_client: Optional[PersistentClient] = None
+_chroma_client = PersistentClient(path=PERSIST_DIR)
 _chroma_collection = None
 
+# client = PersistentClient(path=PERSIST_DIR)
+# col = client.get_collection(name=COLLECTION_NAME, embedding_function=embed_fn)
 
 # =========================
 # Embeddings
@@ -79,27 +98,40 @@ def _open_client() -> PersistentClient:
     return _chroma_client
 
 
-def _pick_nonempty_collection(client: PersistentClient, preferred: str) -> Any:
+def _pick_nonempty_collection(client: PersistentClient, preferred: str): # -> Any:
     """
     选择一个可用集合：
       1) 如果 preferred 存在且非空，返回它
       2) 否则扫描所有集合，选择第一个 count()>0 的
       3) 如果所有集合都为空或不存在 → 抛错并给出诊断建议
     """
+
+    def get(name):
+        return client.get_collection(name=name, embedding_function=embed_fn)
+
     # Try preferred
     try:
-        col = client.get_collection(preferred)
+        # col = client.get_collection(preferred)
+        col = get(preferred)
         try:
             if col.count() > 0:
                 return col
         except Exception:
+            pass
             # some older chroma may not support count() well; fall back to querying 1
+            # try:
+            #    test = col.query(query_embeddings=[[0.0]], n_results=1)
+            #    if test and test.get("ids"):
+            #        return col
+            #except Exception:
+            #    pass
+        for c in client.list_collections():
             try:
-                test = col.query(query_embeddings=[[0.0]], n_results=1)
-                if test and test.get("ids"):
+                col = get(c.name)
+                if col.count() > 0:
                     return col
             except Exception:
-                pass
+                continue        
     except Exception:
         # preferred not found
         pass
@@ -135,50 +167,58 @@ def _pick_nonempty_collection(client: PersistentClient, preferred: str) -> Any:
     )
 
 
+# def get_chroma_collection():
+#    global _chroma_collection
+#    if _chroma_collection is None:
+#        client = _open_client()
+#        _chroma_collection = _pick_nonempty_collection(client, COLLECTION_NAME)
+#    return _chroma_collection
+
 def get_chroma_collection():
-    global _chroma_collection
-    if _chroma_collection is None:
-        client = _open_client()
-        _chroma_collection = _pick_nonempty_collection(client, COLLECTION_NAME)
-    return _chroma_collection
+    client = PersistentClient(path=PERSIST_DIR)
+    # BIND the embedding function here
+    # return client.get_collection(name=COLLECTION, embedding_function=embed_fn)
+    return client.get_collection(name=COLLECTION)
 
 
 # =========================
 # Guideline search (Chroma)
 # =========================
-def search_guidelines(query: str, k: int = 6,
-                      where: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    """
+"""
     语义检索（cosine 距离→相似度 1 - distance）
     返回：[{id, content, meta, score, source}]
-    """
+"""
+def search_guidelines(query: str, k: int = 6, where: Optional[Dict[str, Any]] = None):
     col = get_chroma_collection()
-    qvec = embed_text(query)
+    enc = get_embedder()  # loads BAAI/bge-large-zh-v1.5 on cuda/cpu
+    qvec = enc.encode([query], normalize_embeddings=True).tolist()
 
+    # kwargs = dict(query_texts=[query], n_results=k,
+    #               include=["documents", "metadatas", "distances"])
     kwargs = dict(
-        query_embeddings=[qvec],
+        query_embeddings=qvec,
         n_results=k,
         include=["documents", "metadatas", "distances"],
-    )
-    # NEVER pass an empty where
-    if where is not None and len(where) > 0:
-        kwargs["where"] = where
+    )   
+    if where:
+        kwargs["where"] = where  # never pass empty dict
 
     try:
         res = col.query(**kwargs)
     except ValueError as e:
+        # guard against malformed where
         if "Expected where to have exactly one operator" in str(e) and "where" in kwargs:
             kwargs.pop("where", None)
             res = col.query(**kwargs)
         else:
             raise
 
-    ids = res.get("ids", [[]])[0]
-    docs = res.get("documents", [[]])[0]
+    ids   = res.get("ids", [[]])[0]
+    docs  = res.get("documents", [[]])[0]
     metas = res.get("metadatas", [[]])[0]
     dists = res.get("distances", [[]])[0]
 
-    out: List[Dict[str, Any]] = []
+    out = []
     for i in range(len(ids)):
         distance = float(dists[i]) if dists else 1.0
         sim = max(0.0, min(1.0, 1.0 - distance))
@@ -187,10 +227,9 @@ def search_guidelines(query: str, k: int = 6,
             "content": docs[i],
             "meta": metas[i],
             "score": sim,
-            "source": "guideline"
+            "source": "guideline",
         })
     return out
-
 
 # =========================
 # Drug search (SQLite)
@@ -233,12 +272,14 @@ def search_drugs(query: str, k: int = 6) -> List[Dict[str, Any]]:
             cur = con.cursor()
             cur.execute(sql, (query, k))
             rows = cur.fetchall()
-            out: List[Dict[str, Any]] = []
+            out = []
             for r in rows:
-                bm25 = float(r["rank"]) if r["rank"] is not None else 10.0
-                sim = 1.0 / (1.0 + bm25)
-                meta = {k: r[k] for k in r.keys()}
-                content = f"{r['name']}（{r.get('generic_name','-')}）\n适应症: {trim(meta.get('indications'))}"
+                meta = {k: r[k] for k in r.keys()}           # dict copy
+                fields = ["name","generic_name","indications","contraindications","interactions"]
+                hay = " ".join((meta.get(f) or "") for f in fields)
+                hits = sum(1 for f in fields if meta.get(f) and (query in meta.get(f, "")))
+                sim = max(0.3, min(1.0, (hits + (1 if query in hay else 0)) / (len(fields) + 1)))
+                content = f"{meta.get('name','?')}（{meta.get('generic_name','-')}）\n适应症: {trim(meta.get('indications'))}"
                 out.append({
                     "id": f"drug:{r['id']}",
                     "content": content,
@@ -261,22 +302,23 @@ def search_drugs(query: str, k: int = 6) -> List[Dict[str, Any]]:
             """
             cur.execute(sql, (kw, kw, kw, kw, kw, k))
             rows = cur.fetchall()
-            out: List[Dict[str, Any]] = []
+            out = []
             for r in rows:
+                meta = {k: r[k] for k in r.keys()}           # dict copy
                 fields = ["name", "generic_name", "indications", "contraindications", "interactions"]
-                hay = " ".join((r.get(f) or "") for f in fields)
-                hits = sum(1 for f in fields if (r.get(f) and (query in (r[f] or ""))))
+                hay = " ".join((meta.get(f) or "") for f in fields)
+                hits = sum(1 for f in fields if meta.get(f) and (query in (meta.get(f) or "")))
                 sim = max(0.3, min(1.0, (hits + (1 if query in hay else 0)) / (len(fields) + 1)))
-                meta = {k: r[k] for k in r.keys()}
-                content = f"{r['name']}（{r.get('generic_name','-')}）\n适应症: {trim(meta.get('indications'))}"
+                content = f"{meta.get('name','?')}（{meta.get('generic_name','-')}）\n适应症: {trim(meta.get('indications'))}"
                 out.append({
-                    "id": f"drug:{r['id']}",
+                    "id": f"drug:{meta.get('id','')}",
                     "content": content,
                     "meta": meta,
                     "score": sim,
-                    "source": "drug"
+                    "source": "drug",
                 })
             return out
+        
     finally:
         con.close()
 
@@ -346,6 +388,8 @@ def diagnose() -> None:
     try:
         client = _open_client()
         cols = client.list_collections()
+        col = get_chroma_collection()
+        print("Using collection:", col.name, "| count:", col.count())    
         if not cols:
             print("No collections found.")
         else:
@@ -403,7 +447,7 @@ def main():
     args = parser.parse_args()
 
     print(f"Embedding model: {EMBED_MODEL}")
-    print(f"Chroma dir:     {CHROMA_DIR} | preferred collection={COLLECTION_NAME}")
+    print(f"Chroma dir:     {CHROMA_DIR} | preferred collection={COLLECTION}")
     print(f"SQLite path:    {SQLITE_PATH}")
 
     if args.diagnose:
